@@ -46,6 +46,7 @@ function handleWebsocketMessage(message) {
             return filterTrustSetTransactions(result.result.transactions);
         })
         .each(function (transaction) {
+            // TODO: check to make sure this account hasn't been paid out before
             return payoutAccount(transaction.tx.Account)
                 .then(function (result) {
                     console.log(result);
