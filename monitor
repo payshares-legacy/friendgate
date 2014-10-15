@@ -1,0 +1,155 @@
+#!/usr/bin/env node
+
+var Promise     = require('bluebird');
+var _           = require('lodash');
+var WebSocket   = require('ws');
+var unirest     = require('unirest');
+var fs          = Promise.promisifyAll(require('fs'));
+
+var config      = require('./config');
+
+var STELLARD_RPC_URL    = "http://" + config.STELLARD_IP + ":" + config.STELLARD_RPC_PORT;
+var STELLARD_WS_URL     = "ws://" + config.STELLARD_IP + ":" + config.STELLARD_WEBSOCKET_PORT;
+var LAST_LEDGER_PATH    = './last_ledger_seen.txt';
+
+var ws;
+var processingTransactions;
+
+initWebsocket();
+
+// Initialize a websocket and subscribe to ledger close events
+function initWebsocket() {
+    ws = new WebSocket(STELLARD_WS_URL);
+    ws.on('message', handleWebsocketMessage);
+    ws.on('open', function () {
+        ws.send('{ "command" : "subscribe",   "streams" : [ "ledger" ] }');
+    });
+}
+
+function handleWebsocketMessage(message) {
+    if (processingTransactions) {
+        // we're still processing the transactions from the last event, wait for the next one
+        return;
+    }
+    var processingTransactions = true;
+    message = JSON.parse(message);
+    // the first message returned from a subscription call contains an inner "result" object, subsequents do not
+    message = message.result ? message.result : message;
+    var ledger_index = message.ledger_index;
+    readLastLedgerSeen()
+        .then(function (index_min) {
+            index_min = Number(index_min);
+            // since we've already seen ledger index_min, add one for the new ledger_min
+            return getAccountTransactions(config.GATEWAY_ADDRESS, index_min + 1);
+        })
+        .then(function (result) {
+            return filterTrustSetTransactions(result.result.transactions);
+        })
+        .each(function (transaction) {
+            return payoutAccount(transaction.tx.Account)
+                .then(function (result) {
+                    console.log(result);
+                    if (result.result.engine_result != "tesSUCCESS") {
+                        console.error(new Error("Payment failed for address " + result.result.tx_json.Destination));
+                    }
+                })
+        })
+        .then(function () {
+            return writeLastLedgerSeen(ledger_index);
+        })
+        .finally(function () {
+            processingTransactions = false;
+        })
+}
+
+/**
+* Reads the last ledger number seen that we recorded in the file.
+*/
+function readLastLedgerSeen() {
+    if (!fs.existsSync(LAST_LEDGER_PATH)) {
+        return Promise.resolve(-1);
+    }
+    return fs.readFileAsync(LAST_LEDGER_PATH, "utf8");
+}
+
+/**
+* Writes the last ledger number seen to a local file.
+*/
+function writeLastLedgerSeen(last) {
+    return fs.writeFileAsync(LAST_LEDGER_PATH, last);
+}
+
+/**
+* Send a payment to the given address with the default amount and currency.
+*/
+function payoutAccount(address) {
+    var data = {
+        "method": "submit",
+        "params": [
+            {
+                "secret": config.GATEWAY_SECRET,
+                "tx_json": {
+                    "TransactionType": "Payment",
+                    "Account": config.GATEWAY_ADDRESS,
+                    "Destination": address,
+                    "Amount": {
+                        "currency": config.GIVEAWAY_CURRENCY,
+                        "value": config.GIVEAWAY_AMOUNT,
+                        "issuer": config.GATEWAY_ADDRESS
+                    }
+                }
+            }
+        ]
+    }
+
+    return new Promise(function (resolve, reject) {
+        unirest.post(STELLARD_RPC_URL)
+            .headers({ 'Accept': 'application/json' })
+            .send(JSON.stringify(data))
+            .end(function (response) {
+                if (response.error) {
+                    reject(response.error);
+                } else {
+                    resolve(response.body);
+                }
+            });
+    });
+}
+
+/**
+* Get the transactions for a given account from the ledger specified by ledger_min.
+*/
+function getAccountTransactions(address, ledger_min) {
+    ledger_min = ledger_min ? ledger_min : -1;
+    var data = {
+        "method": "account_tx",
+        "params": [
+            {
+                "account": address,
+                "ledger_min": ledger_min
+            }
+        ]
+    }
+
+    return new Promise(function (resolve, reject) {
+        unirest.post(STELLARD_RPC_URL)
+            .headers({ 'Accept': 'application/json' })
+            .send(JSON.stringify(data))
+            .end(function (response) {
+                if (response.error) {
+                    reject(response.error);
+                } else {
+                    resolve(response.body);
+                }
+            });
+    });
+}
+
+/**
+* Given an array of transaction objects, return an array of just the TrustSet transaction objects.
+*/
+function filterTrustSetTransactions(transactions) {
+    return _.filter(transactions, function (transaction) {
+        return transaction.tx.TransactionType == "TrustSet";
+    });
+}
